@@ -147,6 +147,10 @@ class CordaConfig:
             by half, but may lead to numerical instability. Defaults to `False`.
         prune_temporary_fields (`bool`):
             If true, temporary fields generated in CorDA preprocessing will be pruned. Defaults to `True`.
+        param_ratio (`Optional[float]`):
+            Target parameter ratio for dynamic rank allocation (CorDA rank strategy). If set, enables rank search.
+        val_adjust (`bool`):
+            Whether to use value adjustment in rank search (CorDA rank strategy).
     """
 
     cache_file: Optional[str] = field(
@@ -193,6 +197,14 @@ class CordaConfig:
     )
     prune_temporary_fields: bool = field(
         default=True, metadata={"help": "If true, temporary fields generated in CorDA preprocessing will be pruned."}
+    )
+    param_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Target parameter ratio for dynamic rank allocation (CorDA rank strategy). If set, enables rank search."}
+    )
+    val_adjust: bool = field(
+        default=False,
+        metadata={"help": "Whether to use value adjustment in rank search (CorDA rank strategy)."}
     )
 
 

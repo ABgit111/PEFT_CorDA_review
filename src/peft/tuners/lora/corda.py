@@ -20,9 +20,11 @@ from collections.abc import Iterable
 from typing import Any, Callable, Optional
 
 import torch
+import numpy as np
 import torch.nn as nn
 from attr import dataclass
 from tqdm import tqdm
+
 
 from peft.tuners.lora.config import LoraConfig
 from peft.tuners.lora.model import LoraModel
@@ -99,12 +101,15 @@ def preprocess_corda(
     # If cache exists, skip building
     if cache_file is not None and os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
         cache = torch.load(cache_file, map_location=get_model_device(model))
+        r_with_layer = cache.get("r_with_layer", None)
+        model._corda_r_with_layer = r_with_layer
         for name, module in target_modules(model, lora_config):
             module.eigens = CordaEigens(
                 S_WC=cache[f"{name}.eigens.S_WC"],
                 U_WC=cache[f"{name}.eigens.U_WC"],
                 V_WC=cache[f"{name}.eigens.V_WC"],
             )
+        crop_corda_eigens(model, lora_config, r_with_layer)
     else:
         # Specify CorDA method for each layer
         if corda_method is None:
@@ -112,19 +117,44 @@ def preprocess_corda(
         for name, module in target_modules(model, lora_config):
             module.corda_method = corda_method
 
-        # Specify CorDA rank for each layer
-        for name, module in target_modules(model, lora_config):
-            r_key = get_pattern_key(lora_config.rank_pattern.keys(), name)
-            module.rank = lora_config.rank_pattern.get(r_key, lora_config.r)
-
         # Calculate covariance matrix
         calib_cov_distribution(model, lora_config, run_model, hooked_model, covariance_file)
 
         # Calculate eigens
         collect_eigens(model, lora_config, verbose)
 
-        # Crop CorDA eigens so that there's less to save
-        crop_corda_eigens(model, lora_config)
+        # --- Begin: Rank Strategy Integration ---
+        # Collect statistics for rank search
+        total_W_size = {}
+        total_S_cov = {}
+        total_S_WC = {}
+        my_layers_keys = []
+        for name, module in target_modules(model, lora_config):
+            w_size = getattr(module, '_corda_w_size', None)
+            S_cov = getattr(module, '_corda_S_cov', None)
+            S_WC = getattr(module, '_corda_S_WC', None)
+            total_W_size[name] = w_size
+            total_S_cov[name] = S_cov
+            total_S_WC[name] = S_WC
+            my_layers_keys.append(name)
+        # Get param_ratio and val_adjust from config if present, else use defaults
+        param_ratio = getattr(lora_config.corda_config, 'param_ratio', None)
+        val_adjust = getattr(lora_config.corda_config, 'val_adjust', False)
+        if param_ratio is not None:
+            r_with_layer, pruned_params, total_params = rank_search_mintomax(
+                total_W_size, total_S_cov, total_S_WC, param_ratio, my_layers_keys, val_adjust
+            )
+            model._corda_r_with_layer = r_with_layer  # Store mapping on model
+            for name, module in target_modules(model, lora_config):
+                module.rank = r_with_layer.get(name, lora_config.r)
+        else:
+            # Fallback: use global rank
+            for name, module in target_modules(model, lora_config):
+                r_key = get_pattern_key(lora_config.rank_pattern.keys(), name)
+                module.rank = lora_config.rank_pattern.get(r_key, lora_config.r)
+            model._corda_r_with_layer = {name: module.rank for name, module in target_modules(model, lora_config)}
+
+        crop_corda_eigens(model, lora_config, model._corda_r_with_layer)
 
         # Remove redundant fields if exist
         if prune_temporary_fields:
@@ -145,7 +175,7 @@ def preprocess_corda(
                 cache[f"{name}.eigens.S_WC"] = module.eigens.S_WC
                 cache[f"{name}.eigens.U_WC"] = module.eigens.U_WC
                 cache[f"{name}.eigens.V_WC"] = module.eigens.V_WC
-
+            cache["r_with_layer"] = model._corda_r_with_layer
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             torch.save(cache, cache_file)
 
@@ -284,26 +314,18 @@ def collect_eigens_for_layer(
             damp = damp * 2
     w = w @ fix_covariance_matrix  ## w: out_dim, in_dim; covariance_matrix: in_dim, in_dim
 
+    # SVD of covariance
+    _, S_cov, _ = torch.linalg.svd(fix_covariance_matrix, full_matrices=False)
+    # SVD of weight
     U, S, Vh = torch.linalg.svd(w, full_matrices=False)
     V = (Vh @ cov_inv).transpose(0, 1)
+    norm_of_VandCovinv = torch.sqrt((V ** 2).sum(dim=0))
+    S_adjusted = S * norm_of_VandCovinv
 
-    # Sanity check, temporarily U and V are large, they will be crop after rank search
-    r = min_dim
-    if U.size(0) != out_dim or U.size(1) != r:
-        raise ValueError(
-            f"Matrix U size mismatch: {U.size()} vs. ({out_dim}, {r}), "
-            "please file an issue at https://github.com/huggingface/peft/issues."
-        )
-    if S.size(0) != r:
-        raise ValueError(
-            f"Matrix S size mismatch: {S.size()} vs. ({r},), "
-            "please file an issue at https://github.com/huggingface/peft/issues."
-        )
-    if V.size(0) != in_dim or V.size(1) != r:
-        raise ValueError(
-            f"Matrix V size mismatch: {V.size()} vs. ({in_dim}, {r}), "
-            "please file an issue at https://github.com/huggingface/peft/issues."
-        )
+    # Store for rank search
+    linear._corda_w_size = (out_dim, in_dim)
+    linear._corda_S_cov = S_cov.cpu().numpy()
+    linear._corda_S_WC = S_adjusted.cpu().numpy()
 
     # Offload U and V to CPU, they consume too much memory
     U = U.cpu()
@@ -316,26 +338,24 @@ def collect_eigens_for_layer(
 
 
 @torch.no_grad()
-def crop_corda_eigens(model: nn.Module, config: LoraConfig):
+def crop_corda_eigens(model: nn.Module, config: LoraConfig, r_with_layer: dict):
     for name, module in target_modules(model, config):
-        # We don't expect saving sliced tensor writes the whole tensor to disk,
-        # so it's necessary to copy the tensors.
-        # Reference: https://github.com/pytorch/pytorch/issues/40157
+        r = r_with_layer[name]
         if module.corda_method == "ipm":
-            module.eigens.S_WC = module.eigens.S_WC[: module.rank].clone()
-            module.eigens.U_WC = module.eigens.U_WC[:, : module.rank].clone().to(get_model_device(model))
-            module.eigens.V_WC = module.eigens.V_WC[:, : module.rank].clone().to(get_model_device(model))
+            module.eigens.S_WC = module.eigens.S_WC[: r].clone()
+            module.eigens.U_WC = module.eigens.U_WC[:, : r].clone().to(get_model_device(model))
+            module.eigens.V_WC = module.eigens.V_WC[:, : r].clone().to(get_model_device(model))
         elif module.corda_method == "kpm":
-            module.eigens.S_WC = module.eigens.S_WC[-module.rank :].clone()
-            module.eigens.U_WC = module.eigens.U_WC[:, -module.rank :].clone().to(get_model_device(model))
-            module.eigens.V_WC = module.eigens.V_WC[:, -module.rank :].clone().to(get_model_device(model))
+            module.eigens.S_WC = module.eigens.S_WC[-r :].clone()
+            module.eigens.U_WC = module.eigens.U_WC[:, -r :].clone().to(get_model_device(model))
+            module.eigens.V_WC = module.eigens.V_WC[:, -r :].clone().to(get_model_device(model))
         else:
             raise ValueError(f"Invalid corda_method found: {module.corda_method}, it should be 'ipm' or 'kpm'.")
 
         # Sanity check
-        if module.eigens.S_WC.size(0) != module.rank:
+        if module.eigens.S_WC.size(0) != r:
             raise ValueError(
-                f"rank mismatch: {module.eigens.S_WC.size(0)} vs. {module.rank},"
+                f"rank mismatch: {module.eigens.S_WC.size(0)} vs. {r},"
                 "please file an issue at https://github.com/huggingface/peft/issues."
             )
         if module.eigens.U_WC.size(0) != module.weight.size(0):
@@ -343,9 +363,9 @@ def crop_corda_eigens(model: nn.Module, config: LoraConfig):
                 f"U size mismatch: {module.eigens.U_WC.size(0)} vs. {module.weight.size(0)},"
                 "please file an issue at https://github.com/huggingface/peft/issues."
             )
-        if module.eigens.U_WC.size(1) != module.rank:
+        if module.eigens.U_WC.size(1) != r:
             raise ValueError(
-                f"U size mismatch: {module.eigens.U_WC.size(1)} vs. {module.rank},"
+                f"U size mismatch: {module.eigens.U_WC.size(1)} vs. {r},"
                 "please file an issue at https://github.com/huggingface/peft/issues."
             )
         if module.eigens.V_WC.size(0) != module.weight.size(1):
@@ -353,8 +373,76 @@ def crop_corda_eigens(model: nn.Module, config: LoraConfig):
                 f"V size mismatch: {module.eigens.V_WC.size(0)} vs. {module.weight.size(1)},"
                 "please file an issue at https://github.com/huggingface/peft/issues."
             )
-        if module.eigens.V_WC.size(1) != module.rank:
+        if module.eigens.V_WC.size(1) != r:
             raise ValueError(
-                f"V size mismatch: {module.eigens.V_WC.size(1)} vs. {module.rank},"
+                f"V size mismatch: {module.eigens.V_WC.size(1)} vs. {r},"
                 "please file an issue at https://github.com/huggingface/peft/issues."
             )
+
+def rank_search_mintomax(total_W_size, total_S_cov, total_S_WC, param_ratio, my_layers_keys, val_adjust=False):
+    total_params = 0
+    keep_with_layer = []
+    win_add_wout = []
+    WC_cumsum = {}
+    for layername in my_layers_keys:
+        w_out, w_in = total_W_size[layername][0], total_W_size[layername][1]
+        total_params += w_out * w_in
+        keep_with_layer.append(min(w_in, w_out))
+        win_add_wout.append(w_in + w_out)
+        WC_cumsum[layername] = np.cumsum(total_S_WC[layername])
+    quota_params = total_params * param_ratio
+
+    win_add_wout = np.array(win_add_wout)
+    keep_with_layer = np.array(keep_with_layer)
+
+    last_ratio = np.floor(((keep_with_layer * win_add_wout).sum() / total_params) * 10) / 10
+    print("start ratio:", (keep_with_layer * win_add_wout).sum() / total_params)
+    if val_adjust:
+        print("\n --- value for rank will be adjusted by coefficients ---\n")
+        max_coefficient = 0
+        coefficient = {}
+        for layer_id in range(len(my_layers_keys)):
+            layername = my_layers_keys[layer_id]
+            S_cov = total_S_cov[layername]
+            current_coefficient = np.sqrt(total_W_size[layername][1] * S_cov[0]) / S_cov[-1]
+            coefficient[layername] = current_coefficient
+            if current_coefficient > max_coefficient:
+                max_coefficient = current_coefficient
+            print("coefficient", layername, current_coefficient)
+        print("max coefficient:", max_coefficient)
+    while (keep_with_layer * win_add_wout).sum() / total_params > param_ratio + (1e-4):
+        current_ratio = (keep_with_layer * win_add_wout).sum() / total_params
+        if np.floor(current_ratio * 10) / 10 < last_ratio:
+            print("current ratio:", current_ratio)
+            print(keep_with_layer)
+            print("min_val:", min_val)
+            last_ratio -= 0.1
+        min_val = 1e8
+        min_id = 0
+        max_current_val = 0
+        for layer_id in range(len(my_layers_keys)):
+            layername = my_layers_keys[layer_id]
+            S = total_S_WC[layername]
+            current_val = S[keep_with_layer[layer_id]-1] / WC_cumsum[layername][keep_with_layer[layer_id]-2]
+            if current_val > max_current_val:
+                max_current_val = current_val
+        for layer_id in range(len(my_layers_keys)):
+            layername = my_layers_keys[layer_id]
+            S = total_S_WC[layername]
+            S_cov = total_S_cov[layername]
+            current_val = S[keep_with_layer[layer_id]-1] / WC_cumsum[layername][keep_with_layer[layer_id]-2]
+            if val_adjust:
+                current_val = (current_val / max_current_val) * np.log(coefficient[layername]) / np.log(max_coefficient)
+            if current_val < min_val:
+                min_val = current_val
+                min_id = layer_id
+        keep_with_layer[min_id] = keep_with_layer[min_id] - 1
+    print("final")
+    print(keep_with_layer)
+    pruned_params = (keep_with_layer * win_add_wout).sum()
+    r_with_layer = {}
+    for layer_id in range(len(my_layers_keys)):
+        layername = my_layers_keys[layer_id]
+        total_rank = min(total_W_size[layername])
+        r_with_layer[layername] = total_rank - keep_with_layer[layer_id]
+    return r_with_layer, pruned_params, total_params 

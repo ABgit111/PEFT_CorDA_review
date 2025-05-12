@@ -59,6 +59,8 @@ def main(args):
     # Perform decomposition
     corda_config = CordaConfig(
         corda_method="ipm" if args.first_eigen else "kpm",
+        param_ratio=args.param_ratio,
+        val_adjust=args.val_adjust,
     )
     lora_config = LoraConfig(
         init_lora_weights="corda",
@@ -156,6 +158,17 @@ if __name__ == "__main__":
         "--save_path",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--param_ratio",
+        type=float,
+        default=None,
+        help="Target parameter ratio for dynamic rank allocation (CorDA rank strategy). If set, enables rank search.",
+    )
+    parser.add_argument(
+        "--val_adjust",
+        action="store_true",
+        help="Whether to use value adjustment in rank search (CorDA rank strategy).",
     )
     args = parser.parse_args()
 

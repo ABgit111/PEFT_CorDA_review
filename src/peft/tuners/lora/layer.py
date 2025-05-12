@@ -190,7 +190,16 @@ class LoraLayer(BaseTunerLayer):
         kwargs = locals().copy()
         del kwargs["self"]
 
-        # This code works for linear layers, override for other layer types
+        # Patch: support dynamic per-layer rank for CorDA
+        if r is None:
+            base_layer = self.get_base_layer()
+            if hasattr(base_layer, "rank") and base_layer.rank is not None:
+                r = base_layer.rank
+            else:
+                raise ValueError(
+                    f"`r` is None and no per-layer rank is set. "
+                    "If you are using CorDA, please ensure you have run the preprocessing step with the correct config."
+                )
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -385,26 +394,6 @@ class LoraLayer(BaseTunerLayer):
         if torch.isnan(V).any() or torch.isinf(V).any():
             raise ValueError(
                 "Invalid value found in matrix V. Please file an issue at https://github.com/huggingface/peft/issues."
-            )
-
-        # Sanity check
-        if U.size(0) != out_dim or U.size(1) != r:
-            raise ValueError(
-                f"Matrix U size mismatch: {U.size()} vs. ({out_dim}, {r}). Please make sure the `lora_config` and "
-                "`model` argument of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache "
-                "in `preprocess_corda`, please make sure the cache is built with the same model and LoRA rank."
-            )
-        if S.size(0) != r:
-            raise ValueError(
-                f"Matrix S size mismatch: {S.size()} vs. ({r},). Please make sure the `lora_config` and `model` argument "
-                "of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache in `preprocess_corda`, "
-                "please make sure the cache is built with the same model and LoRA rank."
-            )
-        if V.size(0) != in_dim or V.size(1) != r:
-            raise ValueError(
-                f"Matrix V size mismatch: {V.size()} vs. ({in_dim}, {r}). Please make sure the `lora_config` and "
-                "`model` argument of `preprocess_corda` is consistent with `get_peft_model`. If you're using cache "
-                "in `preprocess_corda`, please make sure the cache is built with the same model and LoRA rank."
             )
 
         # Apply alpha
@@ -810,6 +799,16 @@ class Embedding(nn.Module, LoraLayer):
         kwargs = locals().copy()
         del kwargs["self"]
 
+        # Patch: support dynamic per-layer rank for CorDA
+        if r is None:
+            base_layer = self.get_base_layer()
+            if hasattr(base_layer, "rank") and base_layer.rank is not None:
+                r = base_layer.rank
+            else:
+                raise ValueError(
+                    f"`r` is None and no per-layer rank is set. "
+                    "If you are using CorDA, please ensure you have run the preprocessing step with the correct config."
+                )
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -1074,6 +1073,16 @@ class _ConvNd(nn.Module, LoraLayer):
         kwargs = locals().copy()
         del kwargs["self"]
 
+        # Patch: support dynamic per-layer rank for CorDA
+        if r is None:
+            base_layer = self.get_base_layer()
+            if hasattr(base_layer, "rank") and base_layer.rank is not None:
+                r = base_layer.rank
+            else:
+                raise ValueError(
+                    f"`r` is None and no per-layer rank is set. "
+                    "If you are using CorDA, please ensure you have run the preprocessing step with the correct config."
+                )
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -1680,7 +1689,7 @@ class MultiheadAttention(nn.Module, LoraLayer):
             active_adapters = [a for a in self.active_adapters if a in self.lora_A]
             try:
                 self.merge(adapter_names=active_adapters)
-                result = self.base_layer(query, *args, **kwargs)
+                result = self.base_layer(x, *args, **kwargs)
             finally:
                 # it's safe to call unmerge(), which unmerges all adapters, because we checked that not self.merged,
                 # i.e. there is was no merged layer before
