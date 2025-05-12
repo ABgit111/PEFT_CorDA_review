@@ -1689,7 +1689,7 @@ class MultiheadAttention(nn.Module, LoraLayer):
             active_adapters = [a for a in self.active_adapters if a in self.lora_A]
             try:
                 self.merge(adapter_names=active_adapters)
-                result = self.base_layer(x, *args, **kwargs)
+                result = self.base_layer(query, *args, **kwargs)
             finally:
                 # it's safe to call unmerge(), which unmerges all adapters, because we checked that not self.merged,
                 # i.e. there is was no merged layer before
